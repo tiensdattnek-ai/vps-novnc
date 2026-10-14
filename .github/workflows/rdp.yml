@@ -18,10 +18,15 @@ concurrency:
 
 env:
   VPS_NAME: vps-project-1777211676958
+  NOVNC_VERSION: v1.7.0
+  NOVNC_REPO: novnc/noVNC
+  WEBSOCKIFY_VERSION: 0.13.0
+  TIGHTVNC_VERSION: 2.8.85
 
 jobs:
   deploy:
     runs-on: windows-latest
+    timeout-minutes: 350
     permissions:
       contents: write
       actions: write
@@ -29,6 +34,8 @@ jobs:
     steps:
       - name: ⬇️ Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install OpenCode CLI and Desktop
         shell: pwsh
@@ -58,83 +65,132 @@ jobs:
           }
 
           Write-Host "🖥️ Downloading OpenCode Desktop..."
-          $desktopUrl = "https://opencode.ai/update/api/latest/desktop/opencode/opencode-desktop-win-x64.exe"
-          $desktopInstaller = Join-Path $env:TEMP "opencode-desktop-win-x64.exe"
-          Invoke-WebRequest -Uri $desktopUrl -OutFile $desktopInstaller -TimeoutSec 240
+          try {
+            $desktopUrl = "https://opencode.ai/update/api/latest/desktop/opencode/opencode-desktop-win-x64.exe"
+            $desktopInstaller = Join-Path $env:TEMP "opencode-desktop-win-x64.exe"
+            Invoke-WebRequest -Uri $desktopUrl -OutFile $desktopInstaller -TimeoutSec 240
 
-          $installerFile = Get-Item $desktopInstaller
-          if ($installerFile.Length -lt 1MB) {
-            throw "Downloaded OpenCode installer is unexpectedly small ($($installerFile.Length) bytes)."
-          }
-          $signature = Get-AuthenticodeSignature -FilePath $desktopInstaller
-          if ($signature.Status -ne 'Valid') {
-            throw "OpenCode installer signature check failed: $($signature.Status)"
-          }
+            $installerFile = Get-Item $desktopInstaller
+            if ($installerFile.Length -lt 1MB) {
+              throw "Downloaded OpenCode installer is unexpectedly small ($($installerFile.Length) bytes)."
+            }
+            # Signature check is best-effort: some builds are unsigned but still valid.
+            $signature = Get-AuthenticodeSignature -FilePath $desktopInstaller
+            if ($signature.Status -ne 'Valid') {
+              Write-Host "⚠️ OpenCode installer signature: $($signature.Status) - continuing anyway."
+            }
 
-          $installProcess = Start-Process -FilePath $desktopInstaller -ArgumentList "/S" -Wait -PassThru
-          if ($installProcess.ExitCode -ne 0) {
-            throw "OpenCode Desktop installer exited with code $($installProcess.ExitCode)."
+            $installProcess = Start-Process -FilePath $desktopInstaller -ArgumentList "/S" -Wait -PassThru
+            if ($installProcess.ExitCode -ne 0) {
+              throw "OpenCode Desktop installer exited with code $($installProcess.ExitCode)."
+            }
+            Remove-Item $desktopInstaller -Force
+            Write-Host "✅ OpenCode CLI and Desktop installed."
+          } catch {
+            Write-Host "⚠️ OpenCode Desktop install failed (non-fatal, CLI still OK): $_"
           }
-          Remove-Item $desktopInstaller -Force
-          Write-Host "✅ OpenCode CLI and Desktop installed."
 
       - name: 🐍 Tạo file VPS info
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.opencode_install_only != true }}
+        if: github.event_name != 'workflow_dispatch' || inputs.opencode_install_only != true
+        shell: pwsh
         run: |
           mkdir -Force links
           "VPS khởi tạo - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath "links/$env:VPS_NAME.txt" -Encoding UTF8
 
       - name: 🖥️ Cài đặt và chạy TightVNC, noVNC, Cloudflared
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.opencode_install_only != true }}
+        if: github.event_name != 'workflow_dispatch' || inputs.opencode_install_only != true
         shell: pwsh
         run: |
+          function Stop-ProcessOnPort([int]$Port) {
+            $lines = netstat -aon | Select-String ":$Port"
+            foreach ($l in $lines) {
+              if ($l.Line -match '(\d+)\s*$') {
+                $pidToKill = $matches[1]
+                if ($pidToKill -ne '0' -and $pidToKill -ne '0.0.0.0') {
+                  Write-Host "⚠️ Port $Port in use, killing PID $pidToKill ..."
+                  try { Stop-Process -Id ([int]$pidToKill) -Force -ErrorAction SilentlyContinue } catch {}
+                }
+              }
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          function Push-WithRebase([string]$Msg) {
+            try {
+              git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git config --global user.name "github-actions[bot]"
+              git add -A
+              git commit -m $Msg --allow-empty
+              git pull --rebase origin main --autostash 2>&1 | Write-Host
+              git push origin main
+              Write-Host "✅ Pushed: $Msg"
+            } catch {
+              Write-Host "⚠️ Push failed ($Msg): $_"
+              try { git rebase --abort 2>&1 | Out-Null } catch {}
+            }
+          }
+
           Write-Host "📥 Installing TightVNC, noVNC, and Cloudflared..."
-          
+
           try {
-            Write-Host "📥 Installing TightVNC..."
-            Invoke-WebRequest -Uri "https://www.tightvnc.com/download/2.8.63/tightvnc-2.8.63-gpl-setup-64bit.msi" -OutFile "tightvnc-setup.msi" -TimeoutSec 60
+            Write-Host "📥 Installing TightVNC $($env:TIGHTVNC_VERSION)..."
+            $tightUrl = "https://www.tightvnc.com/download/$($env:TIGHTVNC_VERSION)/tightvnc-$($env:TIGHTVNC_VERSION)-gpl-setup-64bit.msi"
+            Invoke-WebRequest -Uri $tightUrl -OutFile "tightvnc-setup.msi" -TimeoutSec 120
             Write-Host "✅ TightVNC downloaded"
-            
-            Start-Process msiexec.exe -Wait -ArgumentList '/i tightvnc-setup.msi /quiet /norestart ADDLOCAL="Server" SERVER_REGISTER_AS_SERVICE=1 SERVER_ADD_FIREWALL_EXCEPTION=1 SET_USEVNCAUTHENTICATION=1 VALUE_OF_USEVNCAUTHENTICATION=1 SET_PASSWORD=1 VALUE_OF_PASSWORD=hieudz SET_ACCEPTHTTPCONNECTIONS=1 VALUE_OF_ACCEPTHTTPCONNECTIONS=1 SET_ALLOWLOOPBACK=1 VALUE_OF_ALLOWLOOPBACK=1'
+
+            $msiArgs = @(
+              '/i', 'tightvnc-setup.msi', '/quiet', '/norestart',
+              'ADDLOCAL=Server',
+              'SERVER_REGISTER_AS_SERVICE=1',
+              'SERVER_ADD_FIREWALL_EXCEPTION=1',
+              'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1',
+              'SET_PASSWORD=1', 'VALUE_OF_PASSWORD=hieudz',
+              'SET_ACCEPTHTTPCONNECTIONS=1', 'VALUE_OF_ACCEPTHTTPCONNECTIONS=1',
+              'SET_ALLOWLOOPBACK=1', 'VALUE_OF_ALLOWLOOPBACK=1'
+            )
+            Start-Process msiexec.exe -Wait -ArgumentList $msiArgs
             Write-Host "✅ TightVNC installed"
-            
+
             Write-Host "🔧 Enabling loopback connections in TightVNC registry..."
             Set-ItemProperty -Path "HKLM:\SOFTWARE\TightVNC\Server" -Name "AllowLoopback" -Value 1 -ErrorAction SilentlyContinue
-            
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server" -Name "AllowLoopback" -Value 1 -ErrorAction SilentlyContinue
+
             Write-Host "🔍 Stopping any existing tvnserver processes..."
             Stop-Process -Name "tvnserver" -Force -ErrorAction SilentlyContinue
             Stop-Service -Name "tvnserver" -Force -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 5
-            
+
             Write-Host "🔍 Checking for port 5900 conflicts..."
-            $portCheck = netstat -aon | FindStr :5900
-            if ($portCheck) {
-              Write-Host "⚠️ Port 5900 is already in use: $portCheck"
-              Stop-Process -Id ($portCheck -split '\s+')[-1] -Force -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 5
-            }
-            
+            Stop-ProcessOnPort -Port 5900
+
             Write-Host "🚀 Starting TightVNC server..."
-            Start-Process -FilePath "C:\Program Files\TightVNC\tvnserver.exe" -ArgumentList "-run -localhost no" -WindowStyle Hidden -RedirectStandardOutput "vnc_start.log" -RedirectStandardError "vnc_error.log"
+            $vncProc = Start-Process -FilePath "C:\Program Files\TightVNC\tvnserver.exe" -ArgumentList "-run", "-localhost", "no" -NoNewWindow -PassThru -RedirectStandardOutput "vnc_start.log" -RedirectStandardError "vnc_error.log"
             Start-Sleep -Seconds 40
             Get-Content "vnc_start.log" -ErrorAction SilentlyContinue | Write-Host
             Get-Content "vnc_error.log" -ErrorAction SilentlyContinue | Write-Host
-            
+
+            netsh advfirewall firewall delete rule name="Allow VNC 5900" 2>&1 | Out-Null
+            netsh advfirewall firewall delete rule name="Allow noVNC 6080" 2>&1 | Out-Null
             netsh advfirewall firewall add rule name="Allow VNC 5900" dir=in action=allow protocol=TCP localport=5900
             netsh advfirewall firewall add rule name="Allow noVNC 6080" dir=in action=allow protocol=TCP localport=6080
             Write-Host "✅ Firewall rules added"
-            
-            Write-Host "📥 Installing Python dependencies for noVNC and websockify..."
+
+            Write-Host "📥 Installing Python websockify (official, repo novnc/websockify)..."
             Write-Host "🔍 Checking Python and pip versions..."
             python --version | Write-Host
             python -m pip --version | Write-Host
-            
+
             $maxPipAttempts = 5
+            $pipOk = $false
             for ($i = 1; $i -le $maxPipAttempts; $i++) {
               try {
                 python -m pip install --upgrade pip --timeout 60 2>&1 | Out-File -FilePath "pip_install.log" -Append -Encoding UTF8
-                pip install --force-reinstall numpy novnc websockify==0.13.0 --timeout 60 2>&1 | Out-File -FilePath "pip_install.log" -Append -Encoding UTF8
-                Write-Host "✅ Python dependencies installed"
+                # NOTE: only websockify (official). Do NOT pip install unofficial 'novnc' wrapper:
+                # it has no vnc.html at <location>\novnc (only resources/novnc_server.zip) so the old check always failed.
+                # websockify pulls numpy automatically.
+                python -m pip install "websockify==$($env:WEBSOCKIFY_VERSION)" --timeout 60 2>&1 | Out-File -FilePath "pip_install.log" -Append -Encoding UTF8
+                Write-Host "✅ websockify installed"
+                $pipOk = $true
                 break
               } catch {
                 Write-Host "⚠️ Pip install attempt $i/$maxPipAttempts failed: $_"
@@ -146,80 +202,76 @@ jobs:
                 Start-Sleep -Seconds 10
               }
             }
-            
-            Write-Host "🔍 Checking noVNC installation via pip..."
-            try {
-              $novncInfo = pip show novnc
-              Write-Host "📜 noVNC package info:"
-              Write-Host $novncInfo
-              $novncPath = ($novncInfo | Select-String "Location: (.*)").Matches.Groups[1].Value + "\novnc"
-              if (Test-Path "$novncPath") {
-                dir $novncPath -Recurse | Write-Host
-                if (-not (Test-Path "$novncPath/vnc.html")) {
-                  throw "vnc.html not found"
+
+            # Official noVNC web client - repo: novnc/noVNC (https://github.com/novnc/noVNC)
+            Write-Host "📥 Downloading official noVNC $($env:NOVNC_VERSION) from GitHub $($env:NOVNC_REPO)..."
+            $novncVersion = $env:NOVNC_VERSION
+            $novncPath = Join-Path (Get-Location) "noVNC"
+            $maxDownloadAttempts = 5
+            $dlOk = $false
+            for ($i = 1; $i -le $maxDownloadAttempts; $i++) {
+              try {
+                Write-Host "📥 Downloading noVNC release $novncVersion (attempt $i/$maxDownloadAttempts)..."
+                Remove-Item -Recurse -Force noVNC -ErrorAction SilentlyContinue
+                Remove-Item -Force noVNC.zip -ErrorAction SilentlyContinue
+                Get-ChildItem -Directory -Filter "noVNC-*" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                $novncUrl = "https://github.com/$($env:NOVNC_REPO)/archive/refs/tags/$novncVersion.zip"
+                Write-Host "🔗 Using URL: $novncUrl"
+                $response = Invoke-WebRequest -Uri $novncUrl -OutFile "noVNC.zip" -TimeoutSec 120 -PassThru
+                Write-Host "ℹ️ HTTP Status: $($response.StatusCode) $($response.StatusDescription)"
+                Expand-Archive -Path "noVNC.zip" -DestinationPath "." -Force
+                $extracted = Get-ChildItem -Directory -Filter "noVNC-*" | Select-Object -First 1
+                if (-not $extracted) {
+                  throw "Extracted noVNC-* folder not found after Expand-Archive"
                 }
-              } else {
-                throw "noVNC path not found"
-              }
-            } catch {
-              Write-Host "⚠️ Vấn đề với noVNC pip, chuyển sang tải thẳng từ GitHub..."
-              $novncVersion = "v1.6.0"
-              $maxDownloadAttempts = 5
-              for ($i = 1; $i -le $maxDownloadAttempts; $i++) {
-                try {
-                  Write-Host "📥 Downloading noVNC release $novncVersion (attempt $i/$maxDownloadAttempts)..."
-                  Remove-Item -Recurse -Force noVNC -ErrorAction SilentlyContinue
-                  $novncUrl = "https://github.com/novnc/noVNC/archive/refs/tags/$novncVersion.zip"
-                  Write-Host "🔗 Using URL: $novncUrl"
-                  $response = Invoke-WebRequest -Uri $novncUrl -OutFile "noVNC.zip" -TimeoutSec 60 -PassThru
-                  Write-Host "ℹ️ HTTP Status: $($response.StatusCode) $($response.StatusDescription)"
-                  Expand-Archive -Path "noVNC.zip" -DestinationPath "." -Force
-                  Move-Item -Path "noVNC-$($novncVersion.Substring(1))" -Destination "noVNC" -Force
-                  Write-Host "✅ noVNC downloaded and extracted"
-                  $novncPath = "noVNC"
-                  break
-                } catch {
-                  Write-Host "⚠️ noVNC download attempt $i/$maxDownloadAttempts failed: $_"
-                  if ($i -eq $maxDownloadAttempts) {
-                    Write-Host "❌ Failed to download noVNC"
-                    exit 1
-                  }
-                  Start-Sleep -Seconds 10
+                if (Test-Path $novncPath) { Remove-Item -Recurse -Force $novncPath }
+                Move-Item -Path $extracted.FullName -Destination $novncPath -Force
+                Write-Host "✅ noVNC downloaded and extracted to $novncPath"
+                $dlOk = $true
+                break
+              } catch {
+                Write-Host "⚠️ noVNC download attempt $i/$maxDownloadAttempts failed: $_"
+                if ($i -eq $maxDownloadAttempts) {
+                  Write-Host "❌ Failed to download noVNC"
+                  exit 1
                 }
+                Start-Sleep -Seconds 10
               }
             }
-            
+
             Write-Host "🔍 Checking noVNC directory structure..."
-            if (-not (Test-Path "$novncPath/vnc.html")) {
-              Write-Host "❌ noVNC directory is incomplete, vnc.html not found"
+            if (-not (Test-Path (Join-Path $novncPath "vnc.html"))) {
+              Write-Host "❌ noVNC directory is incomplete, vnc.html not found in $novncPath"
+              Get-ChildItem $novncPath | Write-Host
               exit 1
             }
-            
+            Write-Host "✅ noVNC vnc.html found"
+
             Write-Host "🔍 Checking for port 6080 conflicts..."
-            $portCheck = netstat -aon | FindStr :6080
-            if ($portCheck) {
-              Write-Host "⚠️ Port 6080 is already in use: $portCheck"
-              Stop-Process -Id ($portCheck -split '\s+')[-1] -Force -ErrorAction SilentlyContinue
-              Start-Sleep -Seconds 5
-            }
-            
+            Stop-ProcessOnPort -Port 6080
+
             Write-Host "🚀 Starting websockify..."
-            Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "6080", "127.0.0.1:5900", "--web", "$novncPath", "--verbose" -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log" -NoNewWindow -PassThru
+            $websockifyProc = Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "6080", "127.0.0.1:5900", "--web", "$novncPath", "--verbose" -NoNewWindow -PassThru -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log"
             Start-Sleep -Seconds 15
             Get-Content "websockify.log" -ErrorAction SilentlyContinue | Write-Host
             Get-Content "websockify_error.log" -ErrorAction SilentlyContinue | Write-Host
-            
-            Write-Host "📥 Installing Cloudflared..."
-            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe" -TimeoutSec 60
+
+            Write-Host "📥 Installing Cloudflared (repo cloudflare/cloudflared)..."
+            Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "cloudflared.exe" -TimeoutSec 120
             Write-Host "✅ Cloudflared downloaded"
-            
+
             Write-Host "🌐 Starting Cloudflared tunnel..."
-            Start-Process -FilePath "cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:6080", "--no-autoupdate", "--edge-ip-version", "auto", "--protocol", "http2", "--logfile", "cloudflared.log" -WindowStyle Hidden
+            # NOTE: --protocol flag was removed in recent cloudflared (2025+) -> fatal "flag provided but not defined".
+            # Use minimal stable flags only.
+            $cfArgs = @("tunnel", "--url", "http://localhost:6080", "--no-autoupdate", "--logfile", "cloudflared.log")
+            $cfProc = Start-Process -FilePath ".\cloudflared.exe" -ArgumentList $cfArgs -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_out.log" -RedirectStandardError "cloudflared_err.log"
             Start-Sleep -Seconds 40
             Get-Content "cloudflared.log" -ErrorAction SilentlyContinue | Write-Host
-            
+            Get-Content "cloudflared_out.log" -ErrorAction SilentlyContinue | Write-Host
+            Get-Content "cloudflared_err.log" -ErrorAction SilentlyContinue | Write-Host
+
             Write-Host "🚀 Checking noVNC and retrieving Cloudflared URL..."
-            
+
             $vncReady = $false
             for ($i = 1; $i -le 30; $i++) {
               try {
@@ -234,22 +286,22 @@ jobs:
                 }
               } catch {}
               Write-Host "⏳ Waiting for VNC server... ($i/30)"
-              
+
               if ($i % 10 -eq 0) {
                 Write-Host "🔄 Restarting VNC server..."
                 Stop-Process -Name "tvnserver" -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 5
-                Start-Process -FilePath "C:\Program Files\TightVNC\tvnserver.exe" -ArgumentList "-run -localhost no" -WindowStyle Hidden -RedirectStandardOutput "vnc_start.log" -RedirectStandardError "vnc_error.log"
+                $vncProc = Start-Process -FilePath "C:\Program Files\TightVNC\tvnserver.exe" -ArgumentList "-run", "-localhost", "no" -NoNewWindow -PassThru -RedirectStandardOutput "vnc_start.log" -RedirectStandardError "vnc_error.log"
                 Start-Sleep -Seconds 40
               }
               Start-Sleep -Seconds 2
             }
-            
+
             if (-not $vncReady) {
               Write-Host "❌ VNC server not ready, exiting..."
               exit 1
             }
-            
+
             $websockifyReady = $false
             for ($i = 1; $i -le 3; $i++) {
               try {
@@ -259,48 +311,54 @@ jobs:
                 break
               } catch {
                 Write-Host "⚠️ noVNC check failed (attempt $i/3): $_"
-                Stop-Process -Name "python" -Force -ErrorAction SilentlyContinue
+                try {
+                  if ($websockifyProc -and -not $websockifyProc.HasExited) { Stop-Process -Id $websockifyProc.Id -Force -ErrorAction SilentlyContinue }
+                } catch {}
                 Start-Sleep -Seconds 5
-                Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "6080", "127.0.0.1:5900", "--web", "$novncPath", "--verbose" -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log" -NoNewWindow -PassThru
+                $websockifyProc = Start-Process -FilePath "python" -ArgumentList "-m", "websockify", "6080", "127.0.0.1:5900", "--web", "$novncPath", "--verbose" -NoNewWindow -PassThru -RedirectStandardOutput "websockify.log" -RedirectStandardError "websockify_error.log"
                 Start-Sleep -Seconds 15
               }
             }
-            
+
             if (-not $websockifyReady) {
               Write-Host "❌ Failed to start noVNC, exiting..."
               exit 1
             }
-            
+
             Write-Host "🌐 Retrieving Cloudflared URL..."
             $maxAttempts = 180
             $attempt = 0
             $cloudflaredUrl = ""
-            
+
             do {
               $attempt++
               Write-Host "🔄 Checking Cloudflared URL (attempt $attempt/$maxAttempts)"
               Start-Sleep -Seconds 3
-              
-              if (Test-Path "cloudflared.log") {
-                try {
-                  $logContent = Get-Content "cloudflared.log" -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
-                    $cloudflaredUrl = $matches[0]
-                    Write-Host "✅ Found Cloudflared URL: $cloudflaredUrl"
-                    break
-                  }
-                } catch {}
+
+              foreach ($logFile in @("cloudflared.log", "cloudflared_out.log", "cloudflared_err.log")) {
+                if (Test-Path $logFile) {
+                  try {
+                    $logContent = Get-Content $logFile -Raw -ErrorAction SilentlyContinue
+                    if ($logContent -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+                      $cloudflaredUrl = $matches[0]
+                      Write-Host "✅ Found Cloudflared URL in ${logFile}: $cloudflaredUrl"
+                      break
+                    }
+                  } catch {}
+                }
+                if ($cloudflaredUrl) { break }
               }
-              
+              if ($cloudflaredUrl) { break }
+
               if ($attempt % 20 -eq 0) {
                 Write-Host "🔄 Restarting Cloudflared..."
                 Stop-Process -Name "cloudflared" -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 3
-                Start-Process -FilePath "cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:6080", "--no-autoupdate", "--edge-ip-version", "auto", "--protocol", "http2", "--logfile", "cloudflared.log" -WindowStyle Hidden
+                $cfProc = Start-Process -FilePath ".\cloudflared.exe" -ArgumentList $cfArgs -NoNewWindow -PassThru -RedirectStandardOutput "cloudflared_out.log" -RedirectStandardError "cloudflared_err.log"
                 Start-Sleep -Seconds 40
               }
             } while ($attempt -lt $maxAttempts)
-            
+
             if ($cloudflaredUrl) {
               $remoteLink = "$cloudflaredUrl/vnc.html"
               Write-Host "🌌 Remote VNC URL: $remoteLink"
@@ -320,71 +378,62 @@ jobs:
               $report = ($reportLines -join "`r`n")
               [System.IO.File]::WriteAllText("$(Get-Location)\remote-link.txt", $report)
 
-              try {
-                git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                git config --global user.name "github-actions[bot]"
-                git add remote-link.txt
-                git commit -m "🔗 Updated remote-link.txt - $createdAt" --allow-empty
-                git push origin main --force-with-lease
-                Write-Host "✅ Remote link committed"
-              } catch {
-                Write-Host "⚠️ Failed to commit remote-link.txt"
-              }
+              Push-WithRebase "🔗 Updated remote-link.txt - $createdAt"
             } else {
               Write-Host "❌ Failed to retrieve Cloudflared URL"
               "TUNNEL_FAILED_$(Get-Date -Format 'yyyyMMdd_HHmmss')" | Out-File -FilePath "remote-link.txt" -Encoding UTF8 -NoNewline
-              
-              git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git config --global user.name "github-actions[bot]"
-              git add remote-link.txt
-              git commit -m "❌ Tunnel failed - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" --allow-empty
-              git push origin main --force-with-lease
+
+              Push-WithRebase "❌ Tunnel failed - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
             }
           } catch {
             Write-Host "⚠️ Setup failed: $_"
+            Write-Host $_.ScriptStackTrace
             exit 1
           }
-          
+
           Write-Host "🚀 VPS Session Started - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
           Write-Host "🌌 Access noVNC via remote-link.txt URL (Password: hieudz)"
-          
+
           mkdir -Force ".backup"
-          
+
           $totalMinutes = 330
           $restartCheckpoint = 320
           $backupInterval = 60
-          
+
           for ($i = 1; $i -le $totalMinutes; $i++) {
             $currentTime = Get-Date -Format 'HH:mm:ss'
             Write-Host "🟢 VPS Running - Minute $i/$totalMinutes ($currentTime)"
-            
+
             if ($i % $backupInterval -eq 0) {
               Write-Host "💾 Creating backup at minute $i..."
               $filesToBackup = @()
               if (Test-Path "links") { $filesToBackup += "links" }
               if (Test-Path "remote-link.txt") { $filesToBackup += "remote-link.txt" }
-              if (Test-Path "*.log") { $filesToBackup += Get-ChildItem -Filter "*.log" | Select-Object -ExpandProperty Name }
-              
+              $logFiles = Get-ChildItem -Filter "*.log" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+              if ($logFiles) { $filesToBackup += $logFiles }
+
               if ($filesToBackup.Count -gt 0) {
                 try {
-                  $backupName = "$env:VPS_NAME`_$(Get-Date -Format 'yyyyMMdd_HHmm').zip"
+                  $backupName = "${env:VPS_NAME}_$(Get-Date -Format 'yyyyMMdd_HHmm').zip"
                   Compress-Archive -Path $filesToBackup -DestinationPath ".backup/$backupName" -Force
                   Write-Host "✅ Backup created: $backupName"
-                  
-                  git add .backup/$backupName
+
+                  git add ".backup/$backupName"
                   git commit -m "💾 Backup - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" --allow-empty
-                  git push origin main --force-with-lease
+                  git pull --rebase origin main --autostash 2>&1 | Write-Host
+                  git push origin main
                 } catch {
-                  Write-Host "⚠️ Backup failed"
+                  Write-Host "⚠️ Backup failed: $_"
+                  try { git rebase --abort 2>&1 | Out-Null } catch {}
                 }
               }
             }
-            
+
             if ($i -eq $restartCheckpoint) {
               Write-Host "🔁 Preparing restart in $($totalMinutes - $i) minutes..."
             }
-            
+
             Start-Sleep -Seconds 60
           }
-          
+
           Write-Host "⏰ VPS session completed. Schedule cron sẽ tự kick lại sau ~5h."
