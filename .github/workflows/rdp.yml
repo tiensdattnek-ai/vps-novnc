@@ -12,7 +12,8 @@ on:
     - cron: "0 */5 * * *"
 
 concurrency:
-  group: vps-novnc-runner
+  # Keep the install-only smoke test from cancelling an active desktop session.
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.opencode_install_only == true && format('opencode-install-only-{0}', github.run_id) || 'vps-novnc-runner' }}
   cancel-in-progress: true
 
 env:
