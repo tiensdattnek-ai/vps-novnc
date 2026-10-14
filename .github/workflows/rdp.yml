@@ -2,6 +2,12 @@ name: Create VPS (Auto Restart)
 
 on:
   workflow_dispatch:
+    inputs:
+      opencode_install_only:
+        description: "Only test OpenCode installation; skip VNC and Cloudflare setup"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "0 */5 * * *"
 
@@ -23,12 +29,62 @@ jobs:
       - name: ⬇️ Checkout source
         uses: actions/checkout@v4
 
+      - name: Install OpenCode CLI and Desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "📦 Installing OpenCode CLI..."
+          npm install -g @opencode/cli
+          if ($LASTEXITCODE -ne 0) {
+            throw "npm install failed with exit code $LASTEXITCODE"
+          }
+
+          $npmPrefix = (& npm prefix -g).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($npmPrefix)) {
+            throw "Could not determine the global npm prefix."
+          }
+          $npmPrefix | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "$npmPrefix;$env:PATH"
+
+          $opencodeCmd = Join-Path $npmPrefix "opencode.cmd"
+          if (-not (Test-Path $opencodeCmd)) {
+            throw "OpenCode CLI shim not found at $opencodeCmd"
+          }
+          & $opencodeCmd --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "OpenCode CLI failed its version check."
+          }
+
+          Write-Host "🖥️ Downloading OpenCode Desktop..."
+          $desktopUrl = "https://opencode.ai/update/api/latest/desktop/opencode/opencode-desktop-win-x64.exe"
+          $desktopInstaller = Join-Path $env:TEMP "opencode-desktop-win-x64.exe"
+          Invoke-WebRequest -Uri $desktopUrl -OutFile $desktopInstaller -TimeoutSec 240
+
+          $installerFile = Get-Item $desktopInstaller
+          if ($installerFile.Length -lt 1MB) {
+            throw "Downloaded OpenCode installer is unexpectedly small ($($installerFile.Length) bytes)."
+          }
+          $signature = Get-AuthenticodeSignature -FilePath $desktopInstaller
+          if ($signature.Status -ne 'Valid') {
+            throw "OpenCode installer signature check failed: $($signature.Status)"
+          }
+
+          $installProcess = Start-Process -FilePath $desktopInstaller -ArgumentList "/S" -Wait -PassThru
+          if ($installProcess.ExitCode -ne 0) {
+            throw "OpenCode Desktop installer exited with code $($installProcess.ExitCode)."
+          }
+          Remove-Item $desktopInstaller -Force
+          Write-Host "✅ OpenCode CLI and Desktop installed."
+
       - name: 🐍 Tạo file VPS info
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.opencode_install_only != true }}
         run: |
           mkdir -Force links
           "VPS khởi tạo - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" | Out-File -FilePath "links/$env:VPS_NAME.txt" -Encoding UTF8
 
       - name: 🖥️ Cài đặt và chạy TightVNC, noVNC, Cloudflared
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.opencode_install_only != true }}
         shell: pwsh
         run: |
           Write-Host "📥 Installing TightVNC, noVNC, and Cloudflared..."
